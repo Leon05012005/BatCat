@@ -56,7 +56,10 @@ async function ensureWelcomePanel() {
 
     try {
 
-        // Get the welcome channel
+        // ==========================================
+        // GET WELCOME CHANNEL
+        // ==========================================
+
         const channel =
             await client.channels.fetch(
                 process.env.WELCOME_CHANNEL_ID
@@ -85,7 +88,7 @@ async function ensureWelcomePanel() {
 
 
         // ==========================================
-        // CHECK FOR EXISTING PANEL
+        // CHECK RECENT MESSAGES
         // ==========================================
 
         const messages =
@@ -119,13 +122,85 @@ async function ensureWelcomePanel() {
 
 
         // ==========================================
-        // PANEL ALREADY EXISTS
+        // NO PANEL → CREATE ONE
         // ==========================================
 
-        if (existingPanels.size > 0) {
+        if (existingPanels.size === 0) {
 
             console.log(
-                '✅ Welcome panel already exists. No new panel created.'
+                '📝 No welcome panel found. Creating one...'
+            );
+
+        }
+
+
+        // ==========================================
+        // MULTIPLE PANELS → CLEAN THEM UP
+        // ==========================================
+
+        if (existingPanels.size > 1) {
+
+            console.log(
+                `⚠️ Found ${existingPanels.size} welcome panels. Cleaning up duplicates...`
+            );
+
+
+            // Sort newest → oldest
+            const panels =
+                [...existingPanels.values()]
+                    .sort(
+                        (a, b) =>
+                            b.createdTimestamp -
+                            a.createdTimestamp
+                    );
+
+
+            // Keep the newest panel
+            const newestPanel =
+                panels[0];
+
+
+            // Delete all older panels
+            for (
+                const oldPanel of panels.slice(1)
+            ) {
+
+                try {
+
+                    await oldPanel.delete();
+
+                    console.log(
+                        `🗑️ Deleted duplicate welcome panel: ${oldPanel.id}`
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        `❌ Could not delete panel ${oldPanel.id}:`,
+                        error.message
+                    );
+
+                }
+
+            }
+
+
+            console.log(
+                `✅ Kept newest welcome panel: ${newestPanel.id}`
+            );
+
+            return;
+        }
+
+
+        // ==========================================
+        // EXACTLY ONE PANEL → KEEP IT
+        // ==========================================
+
+        if (existingPanels.size === 1) {
+
+            console.log(
+                '✅ Exactly one welcome panel exists. No new panel created.'
             );
 
             return;
@@ -145,7 +220,9 @@ async function ensureWelcomePanel() {
 
         const row =
             new ActionRowBuilder()
-                .addComponents(registerButton);
+                .addComponents(
+                    registerButton
+                );
 
 
         // ==========================================
@@ -205,7 +282,10 @@ client.once(
         );
 
 
-        // Register slash commands
+        // ==========================================
+        // REGISTER SLASH COMMANDS
+        // ==========================================
+
         try {
 
             await rest.put(
