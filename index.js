@@ -16,6 +16,23 @@ import {
     StringSelectMenuBuilder
 } from 'discord.js';
 
+import {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    VoiceConnectionStatus,
+    StreamType,
+    entersState
+} from '@discordjs/voice';
+
+import { spawn } from 'node:child_process';
+import { PassThrough } from 'node:stream';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import ffmpegPath from 'ffmpeg-static';
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
+
 
 // =====================================================
 // CLIENT
@@ -23,9 +40,333 @@ import {
 
 const client = new Client({
     intents: [
-        GatewayIntentBits.Guilds
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildVoiceStates
     ]
 });
+
+// =====================================================
+// PERSISTENT BIRTHDAY DATA
+// =====================================================
+// Set DATA_DIR=/data on Railway and attach a persistent
+// volume mounted at /data. The default is local ./data.
+const DATA_DIR = process.env.DATA_DIR || './data';
+const DATA_FILE = path.join(DATA_DIR, 'batcat-data.json');
+
+let storedData = { birthdays: {}, lastAnnounced: {} };
+let dataWriteQueue = Promise.resolve();
+
+async function loadStoredData() {
+    await mkdir(DATA_DIR, { recursive: true });
+    try {
+        const parsed = JSON.parse(await readFile(DATA_FILE, 'utf8'));
+        storedData = {
+            birthdays: parsed.birthdays || {},
+            lastAnnounced: parsed.lastAnnounced || {}
+        };
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            console.error('❌ Could not read birthday data:', error);
+        }
+        await saveStoredData();
+    }
+}
+
+function saveStoredData() {
+    // Serialize writes so simultaneous registrations cannot overwrite each other.
+    dataWriteQueue = dataWriteQueue.then(async () => {
+        await mkdir(DATA_DIR, { recursive: true });
+        const tempFile = `${DATA_FILE}.tmp`;
+        await writeFile(tempFile, JSON.stringify(storedData, null, 2), 'utf8');
+        const { rename } = await import('node:fs/promises');
+        await rename(tempFile, DATA_FILE);
+    });
+    return dataWriteQueue;
+}
+
+function getLocalDateParts(date = new Date()) {
+    const timeZone = process.env.TIMEZONE || 'Asia/Ho_Chi_Minh';
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23'
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    return {
+        year: values.year,
+        month: Number(values.month),
+        day: Number(values.day),
+        hour: Number(values.hour),
+        minute: Number(values.minute),
+        dateKey: `${values.year}-${values.month}-${values.day}`
+    };
+}
+
+function parseBirthday(value) {
+    const match = /^(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])$/.exec(value.trim());
+    if (!match) return null;
+    const month = Number(match[1]);
+    const day = Number(match[2]);
+    const daysInMonth = new Date(Date.UTC(2024, month, 0)).getUTCDate();
+    if (day > daysInMonth) return null;
+    return { month, day };
+}
+
+// =====================================================
+// VOICE TTS SESSION
+// =====================================================
+const voicePlayer = createAudioPlayer();
+let voiceSession = null;
+let ttsEnabled = true;
+const speechQueue = [];
+let isSpeakingQueue = false;
+let lastQueuedAt = 0;
+
+voicePlayer.on('error', error => {
+    console.error('❌ TTS audio player error:', error.message);
+});
+
+function getMemberVoiceChannel(member) {
+    return member?.voice?.channel || null;
+}
+
+async function connectTTS(interaction) {
+    const voiceChannel = getMemberVoiceChannel(interaction.member);
+    if (!voiceChannel) {
+        await interaction.reply({
+            content: '🔊 Join the voice channel you want BatCat to use, then run `/voice on` in the text channel he should read. You no longer need `/voice join`.',
+            ephemeral: true
+        });
+        return;
+    }
+
+    try {
+        ttsEnabled = true;
+
+        // If BatCat is already in this VC, simply switch the text channel
+        // being monitored and enable TTS without reconnecting.
+        if (
+            voiceSession?.connection &&
+            voiceSession.guildId === interaction.guildId &&
+            voiceSession.voiceChannelId === voiceChannel.id &&
+            voiceSession.connection.state.status !== VoiceConnectionStatus.Destroyed
+        ) {
+            voiceSession.textChannelId = interaction.channelId;
+            voiceSession.connection.subscribe(voicePlayer);
+
+            await interaction.reply({
+                content: `🦇 BatCat is already in **${voiceChannel.name}**. Automatic TTS is now on for this text channel.`,
+                ephemeral: true
+            });
+            return;
+        }
+
+        if (voiceSession?.connection) {
+            try {
+                voiceSession.connection.destroy();
+            } catch {}
+        }
+        voiceSession = null;
+
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: interaction.guildId,
+            adapterCreator: interaction.guild.voiceAdapterCreator,
+            selfDeaf: false,
+            selfMute: false
+        });
+
+        await entersState(connection, VoiceConnectionStatus.Ready, 25_000);
+
+        voiceSession = {
+            connection,
+            guildId: interaction.guildId,
+            voiceChannelId: voiceChannel.id,
+            textChannelId: interaction.channelId
+        };
+        connection.subscribe(voicePlayer);
+
+        await interaction.reply({
+            content: `🦇 BatCat automatically joined **${voiceChannel.name}**. TTS is on for this text channel using a free Microsoft Edge voice. You can use \`/voice off\` to pause speech or \`/voice leave\` to disconnect.`,
+            ephemeral: true
+        });
+
+        if (interaction.channel?.isTextBased()) {
+            await interaction.channel.send(
+                '🦇 **BatCat TTS is active.** Eligible messages from people in his voice channel will be read aloud. Run `/voice on` again from another text channel to switch what he reads.'
+            );
+        }
+    } catch (error) {
+        console.error('❌ Could not join voice channel:', error);
+        if (voiceSession?.connection) {
+            try {
+                voiceSession.connection.destroy();
+            } catch {}
+        }
+        voiceSession = null;
+
+        if (!interaction.replied) {
+            await interaction.reply({
+                content: '⚠️ I could not join that voice channel. Check BatCat has View Channel, Connect, and Speak permissions.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+async function synthesizeSpeech(text) {
+    // Free Microsoft Edge Read Aloud voice. This is an online service,
+    // so it needs internet access but does not use an OpenAI API key.
+    const tts = new MsEdgeTTS({
+        connectionTimeoutMs: 15000,
+        synthesisTimeoutMs: 60000
+    });
+
+    const voice = process.env.EDGE_TTS_VOICE || 'en-US-AriaNeural';
+    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+
+    const { audioStream } = tts.toStream(text);
+    const chunks = [];
+
+    await new Promise((resolve, reject) => {
+        audioStream.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        audioStream.once('end', resolve);
+        audioStream.once('error', reject);
+        audioStream.once('close', () => {
+            if (chunks.length > 0) resolve();
+        });
+    });
+
+    const audio = Buffer.concat(chunks);
+    if (!audio.length) {
+        throw new Error('Edge TTS returned an empty audio stream.');
+    }
+    return audio;
+}
+
+function mp3ToPcm(mp3Buffer) {
+    return new Promise((resolve, reject) => {
+        const ffmpeg = spawn(ffmpegPath, [
+            '-hide_banner', '-loglevel', 'error',
+            '-i', 'pipe:0',
+            '-f', 's16le', '-ar', '48000', '-ac', '2',
+            'pipe:1'
+        ]);
+
+        const output = [];
+        let stderr = '';
+        ffmpeg.stdout.on('data', chunk => output.push(chunk));
+        ffmpeg.stderr.on('data', chunk => { stderr += chunk.toString(); });
+        ffmpeg.on('error', reject);
+        ffmpeg.on('close', code => {
+            if (code === 0) resolve(Buffer.concat(output));
+            else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(0, 500)}`));
+        });
+        ffmpeg.stdin.on('error', () => {});
+        ffmpeg.stdin.end(mp3Buffer);
+    });
+}
+
+async function playSpeech(text) {
+    if (!voiceSession || !ttsEnabled) return;
+
+    const mp3 = await synthesizeSpeech(text);
+    const pcm = await mp3ToPcm(mp3);
+    if (!voiceSession || !ttsEnabled) return;
+
+    const stream = new PassThrough();
+    const resource = createAudioResource(stream, { inputType: StreamType.Raw });
+    voicePlayer.play(resource);
+    stream.end(pcm);
+
+    await entersState(voicePlayer, AudioPlayerStatus.Playing, 15_000);
+    await entersState(voicePlayer, AudioPlayerStatus.Idle, 120_000);
+}
+
+async function processSpeechQueue() {
+    if (isSpeakingQueue) return;
+    isSpeakingQueue = true;
+    try {
+        while (speechQueue.length > 0) {
+            const item = speechQueue.shift();
+            if (!voiceSession || !ttsEnabled) continue;
+            try {
+                await playSpeech(item);
+            } catch (error) {
+                console.error('❌ Free Edge TTS failed:', error.message);
+            }
+        }
+    } finally {
+        isSpeakingQueue = false;
+    }
+}
+
+function enqueueMessageForTTS(message) {
+    if (!voiceSession || !ttsEnabled || message.author.bot) return;
+    if (message.guildId !== voiceSession.guildId) return;
+    if (message.channelId !== voiceSession.textChannelId) return;
+
+    const memberVoiceChannel = getMemberVoiceChannel(message.member);
+    if (!memberVoiceChannel || memberVoiceChannel.id !== voiceSession.voiceChannelId) return;
+
+    const content = message.content?.trim();
+    if (!content || content.startsWith('/') || content.startsWith('!')) return;
+    if (/https?:\/\/|www\.|discord\.gg\//i.test(content)) return;
+    if (message.attachments.size > 0 && !content) return;
+
+    const cleaned = content
+        .replace(/<@!?\d+>/g, 'someone')
+        .replace(/<#[0-9]+>/g, 'a channel')
+        .replace(/<a?:\w+:\d+>/g, '')
+        .replace(/[*_~`|>]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 350);
+
+    if (!cleaned) return;
+    const now = Date.now();
+    if (now - lastQueuedAt < 1200) return; // avoid rapid-fire spam
+    if (speechQueue.length >= 8) return; // keep the queue bounded
+    lastQueuedAt = now;
+
+    speechQueue.push(`${message.member?.displayName || message.author.username} says: ${cleaned}`);
+    void processSpeechQueue();
+}
+
+async function checkBirthdays() {
+    const channelId = process.env.BIRTHDAY_CHANNEL_ID;
+    if (!channelId || !client.isReady()) return;
+
+    const today = getLocalDateParts();
+
+    // Announce only during 09:00 Vietnam-local time. Never send greetings
+    // immediately on startup or catch up missed announcements later.
+    if (today.hour !== 9 || today.minute !== 0) return;
+
+    for (const [userId, birthday] of Object.entries(storedData.birthdays)) {
+        if (birthday.month !== today.month || birthday.day !== today.day) continue;
+        if (storedData.lastAnnounced[userId] === today.dateKey) continue;
+
+        try {
+            const channel = await client.channels.fetch(channelId);
+            if (!channel?.isTextBased()) {
+                console.error('❌ BIRTHDAY_CHANNEL_ID is not a text channel.');
+                return;
+            }
+            await channel.send(`🎂 Happy birthday, <@${userId}>! Everyone at FUN FUN wishes you an amazing day! 🎉`);
+            storedData.lastAnnounced[userId] = today.dateKey;
+            await saveStoredData();
+        } catch (error) {
+            console.error(`❌ Birthday announcement failed for ${userId}:`, error.message);
+        }
+    }
+}
 
 
 // =====================================================
@@ -35,7 +376,37 @@ const client = new Client({
 const commands = [
     new SlashCommandBuilder()
         .setName('ping')
-        .setDescription('Check if BatCat is working.')
+        .setDescription('Check if BatCat is working.'),
+
+    new SlashCommandBuilder()
+        .setName('voice')
+        .setDescription('Control BatCat voice-chat TTS.')
+        .addSubcommand(subcommand =>
+            subcommand.setName('join').setDescription('Optional: join your voice channel and read this text channel aloud.')
+        )
+        .addSubcommand(subcommand =>
+            subcommand.setName('leave').setDescription('Leave voice chat and stop TTS.')
+        )
+        .addSubcommand(subcommand =>
+            subcommand.setName('on').setDescription('Automatically join your current voice channel and enable TTS for this text channel.')
+        )
+        .addSubcommand(subcommand =>
+            subcommand.setName('off').setDescription('Pause automatic message reading.')
+        ),
+
+    new SlashCommandBuilder()
+        .setName('birthday')
+        .setDescription('Set or update your birthday (month and day only).')
+        .addSubcommand(subcommand =>
+            subcommand.setName('set')
+                .setDescription('Privately save your birthday.')
+                .addIntegerOption(option =>
+                    option.setName('month').setDescription('Birth month (1–12)').setMinValue(1).setMaxValue(12).setRequired(true)
+                )
+                .addIntegerOption(option =>
+                    option.setName('day').setDescription('Birth day').setMinValue(1).setMaxValue(31).setRequired(true)
+                )
+        )
 ].map(command => command.toJSON());
 
 const rest = new REST({
@@ -247,7 +618,7 @@ async function ensureWelcomePanel() {
 
                 'Welcome to the server!\n' +
 
-                'Before entering the community, please register your in-game name below.\n\n' +
+                'Before entering the community, please register your in-game name and birthday below. Your birthday is stored as month/day only (no birth year) and used for a birthday greeting.\n\n' +
 
                 '🎮 **In-game name**\n' +
 
@@ -598,9 +969,15 @@ client.once(
         // PANELS
         // ---------------------------------------------
 
+        await loadStoredData();
         await ensureWelcomePanel();
-
         await ensureRolePanel();
+
+        // Check once a minute. Birthday greetings are sent only at 09:00
+        // Asia/Ho_Chi_Minh; no startup or late catch-up greetings.
+        setInterval(() => {
+            void checkBirthdays();
+        }, 60_000);
     }
 );
 
@@ -622,16 +999,62 @@ client.on(
             interaction.isChatInputCommand()
         ) {
 
-            if (
-                interaction.commandName ===
-                'ping'
-            ) {
-
-                await interaction.reply(
-                    '🦇 Pong!'
-                );
-
+            if (interaction.commandName === 'ping') {
+                await interaction.reply('🦇 Pong!');
                 return;
+            }
+
+            if (interaction.commandName === 'voice') {
+                const subcommand = interaction.options.getSubcommand();
+
+                if (subcommand === 'join') {
+                    await connectTTS(interaction);
+                    return;
+                }
+
+                if (subcommand === 'leave') {
+                    if (voiceSession?.connection) voiceSession.connection.destroy();
+                    voiceSession = null;
+                    speechQueue.length = 0;
+                    await interaction.reply({ content: '🦇 BatCat left voice chat and cleared the speech queue.', ephemeral: true });
+                    return;
+                }
+
+                if (subcommand === 'on') {
+                    // /voice on now automatically joins the VC you're currently in.
+                    await connectTTS(interaction);
+                    return;
+                }
+
+                if (subcommand === 'off') {
+                    ttsEnabled = false;
+                    speechQueue.length = 0;
+                    voicePlayer.stop(true);
+                    await interaction.reply({ content: '🔇 Automatic message reading is paused. Use `/voice on` to resume.', ephemeral: true });
+                    return;
+                }
+            }
+
+            if (interaction.commandName === 'birthday') {
+                const subcommand = interaction.options.getSubcommand();
+                if (subcommand === 'set') {
+                    const month = interaction.options.getInteger('month');
+                    const day = interaction.options.getInteger('day');
+                    const daysInMonth = new Date(Date.UTC(2024, month, 0)).getUTCDate();
+
+                    if (day > daysInMonth) {
+                        await interaction.reply({ content: '⚠️ That date is not valid. Please check the month and day.', ephemeral: true });
+                        return;
+                    }
+
+                    storedData.birthdays[interaction.user.id] = { month, day };
+                    await saveStoredData();
+                    await interaction.reply({
+                        content: `🎂 Your birthday is saved privately as **${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')}**. No birth year is stored.`,
+                        ephemeral: true
+                    });
+                    return;
+                }
             }
         }
 
@@ -734,16 +1157,20 @@ client.on(
                         );
 
 
-                const row =
-                    new ActionRowBuilder()
-                        .addComponents(
-                            ignInput
-                        );
+                const birthdayInput =
+                    new TextInputBuilder()
+                        .setCustomId('birthday')
+                        .setLabel('Birthday (MM/DD, no year)')
+                        .setPlaceholder('Example: 07/24')
+                        .setStyle(TextInputStyle.Short)
+                        .setRequired(true)
+                        .setMinLength(3)
+                        .setMaxLength(5);
 
+                const ignRow = new ActionRowBuilder().addComponents(ignInput);
+                const birthdayRow = new ActionRowBuilder().addComponents(birthdayInput);
 
-                modal.addComponents(
-                    row
-                );
+                modal.addComponents(ignRow, birthdayRow);
 
 
                 await interaction.showModal(
@@ -1018,11 +1445,20 @@ client.on(
 
             const ign =
                 interaction.fields
-                    .getTextInputValue(
-                        'ign'
-                    )
+                    .getTextInputValue('ign')
                     .trim();
 
+            const birthdayText =
+                interaction.fields.getTextInputValue('birthday').trim();
+            const birthday = parseBirthday(birthdayText);
+
+            if (!birthday) {
+                await interaction.reply({
+                    content: '⚠️ Please enter a valid birthday in **MM/DD** format, such as `07/24`. The year is not collected.',
+                    ephemeral: true
+                });
+                return;
+            }
 
             const memberRole =
                 findRoleByName(
@@ -1044,7 +1480,7 @@ client.on(
                         'Please contact a moderator.',
 
                     ephemeral: true
-                });
+                });S
 
                 return;
             }
@@ -1126,13 +1562,13 @@ client.on(
                 // GIVE FANCY MEMBERS
                 // -----------------------------------------
 
-                await interaction.member.roles.add(
-                    memberRole
-                );
+                await interaction.member.roles.add(memberRole);
 
+                storedData.birthdays[interaction.user.id] = birthday;
+                await saveStoredData();
 
                 console.log(
-                    `✅ Fancy Members role given to ${interaction.user.tag}`
+                    `✅ Fancy Members role given to ${interaction.user.tag}; birthday saved as ${String(birthday.month).padStart(2, '0')}/${String(birthday.day).padStart(2, '0')}`
                 );
 
 
@@ -1149,7 +1585,8 @@ client.on(
                         content:
                             '🎉 **Registration complete!**\n\n' +
 
-                            `🎮 **In-game name:** ${ign}\n\n` +
+                            `🎮 **In-game name:** ${ign}\n` +
+                            `🎂 **Birthday:** ${String(birthday.month).padStart(2, '0')}/${String(birthday.day).padStart(2, '0')} (month/day only)\n\n` +
 
                             `✏️ Your server nickname is now **${ign}**.\n\n` +
 
@@ -1167,7 +1604,8 @@ client.on(
                         content:
                             '🎉 **Registration complete!**\n\n' +
 
-                            `🎮 **In-game name:** ${ign}\n\n` +
+                            `🎮 **In-game name:** ${ign}\n` +
+                            `🎂 **Birthday:** ${String(birthday.month).padStart(2, '0')}/${String(birthday.day).padStart(2, '0')} (month/day only)\n\n` +
 
                             '🔓 **Access granted!**\n\n' +
 
@@ -1224,6 +1662,15 @@ client.on(
         }
     }
 );
+
+
+// =====================================================
+// AUTOMATIC TTS MESSAGE LISTENER
+// =====================================================
+
+client.on(Events.MessageCreate, message => {
+    enqueueMessageForTTS(message);
+});
 
 
 // =====================================================
